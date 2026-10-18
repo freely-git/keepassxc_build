@@ -6,7 +6,7 @@ import tempfile
 from datetime import datetime
 from PySide6.QtWidgets import (
     QApplication, QWidget, QLabel, QPushButton, QFileDialog,
-    QMessageBox, QVBoxLayout, QLineEdit, QDialogButtonBox
+    QMessageBox, QVBoxLayout, QLineEdit
 )
 from PySide6.QtCore import Qt, QUrl
 from PySide6.QtGui import QFont, QIcon, QDesktopServices
@@ -14,8 +14,12 @@ from pykeepass import create_database
 
 # // 欢迎使用打包keepass转置工具 * 小旭
 
-GOOGLE_SHEET_URL = "https://www.youtube.com/playlist?list=PLx6mhMXQVPdXc2jL0yluuADXt2BwMDESR"
+GOOGLE_SHEET_URL = "https://www.youtube.com/playlist?list=PLx6mhMXQVPdXc2jL0yluuADXt2BwMDESR"    # ← 记得换成真实链接
 TUTORIAL_URL = "https://docs.google.com/spreadsheets/d/1j6PZ8dkdtHBGLhhYDKggLp9PHIC9x98ENub2v5KbiWE/edit?gid=13182535#gid=13182535"
+
+# 下载保护参数
+DOWNLOAD_TIMEOUT = 60          # 秒
+MAX_DOWNLOAD_SIZE = 20 * 1024 * 1024   # 20 MB
 
 def resource_path(relative_path):
     try:
@@ -143,7 +147,9 @@ class DragDropWidget(QWidget):
                 self.show_message("错误", "请拖入有效的 CSV 文件。")
 
     def open_file_dialog(self, event=None):
-        file_path, _ = QFileDialog.getOpenFileName(self, "选择 CSV 文件", "", "CSV Files (*.csv);;All Files (*)")
+        file_path, _ = QFileDialog.getOpenFileName(
+            self, "选择 CSV 文件", "", "CSV Files (*.csv);;All Files (*)"
+        )
         if file_path:
             self.file_path_display.setText(file_path)
 
@@ -192,7 +198,59 @@ class DragDropWidget(QWidget):
         msg.exec()
 
         if file_path and msg.clickedButton().text() == "打开文件":
-            os.startfile(file_path)
+            # 跨平台打开文件
+            if sys.platform == "win32":
+                os.startfile(file_path)
+            elif sys.platform == "darwin":
+                os.system(f'open "{file_path}"')
+            else:
+                os.system(f'xdg-open "{file_path}"')
+
+    def _download_csv(self, url: str) -> str:
+        """安全下载 CSV，返回临时文件路径。失败抛异常。"""
+        try:
+            with requests.get(
+                url,
+                timeout=DOWNLOAD_TIMEOUT,
+                stream=True,               # 流式读取，避免一次载入内存
+                allow_redirects=True
+            ) as resp:
+                resp.raise_for_status()
+
+                # 优先检查 Content-Length
+                content_length = resp.headers.get("Content-Length")
+                if content_length and int(content_length) > MAX_DOWNLOAD_SIZE:
+                    raise ValueError(
+                        f"文件过大（{int(content_length)/1024/1024:.1f} MB），"
+                        f"超过限制 {MAX_DOWNLOAD_SIZE/1024/1024:.0f} MB"
+                    )
+
+                # 流式写入临时文件并实时检查大小
+                tmp = tempfile.NamedTemporaryFile(
+                    delete=False, suffix=".csv", mode="wb"
+                )
+                downloaded = 0
+                try:
+                    for chunk in resp.iter_content(chunk_size=8192):
+                        if not chunk:
+                            continue
+                        downloaded += len(chunk)
+                        if downloaded > MAX_DOWNLOAD_SIZE:
+                            raise ValueError(
+                                f"下载内容超过限制 {MAX_DOWNLOAD_SIZE/1024/1024:.0f} MB"
+                            )
+                        tmp.write(chunk)
+                    tmp.close()
+                    return tmp.name
+                except Exception:
+                    tmp.close()
+                    if os.path.exists(tmp.name):
+                        os.unlink(tmp.name)
+                    raise
+        except requests.Timeout:
+            raise TimeoutError(f"下载超时（>{DOWNLOAD_TIMEOUT} 秒）")
+        except requests.RequestException as e:
+            raise RuntimeError(f"网络错误：{e}")
 
     def generate_kdbx(self):
         path = self.file_path_display.text().strip()
@@ -200,32 +258,38 @@ class DragDropWidget(QWidget):
             self.show_message("错误", "请输入或选择 CSV 文件路径或下载链接。")
             return
 
-        if path.lower().startswith("http://") or path.lower().startswith("https://"):
-            try:
-                response = requests.get(path)
-                response.raise_for_status()
-                tmp_file = tempfile.NamedTemporaryFile(delete=False, suffix=".csv", mode='wb')
-                tmp_file.write(response.content)
-                tmp_file.close()
-                path = tmp_file.name
-            except Exception as e:
-                self.show_message("下载失败", f"无法下载 CSV 文件：\n{str(e)}")
+        is_temp = False          # 标记是否是程序自己下载的临时文件
+        try:
+            if path.lower().startswith(("http://", "https://")):
+                path = self._download_csv(path)
+                is_temp = True
+
+            if not os.path.exists(path):
+                self.show_message("错误", "找不到文件。")
                 return
 
-        if not os.path.exists(path):
-            self.show_message("错误", "找不到文件。")
-            return
-
-        try:
             file_path, password = self.create_kdbx(path)
-            self.show_message("成功", f"{os.path.basename(file_path)}\n密码：{password}", file_path)
+            self.show_message(
+                "成功",
+                f"{os.path.basename(file_path)}\n密码：{password}",
+                file_path
+            )
         except Exception as e:
             self.show_message("错误", str(e))
+        finally:
+            # 只清理我们自己下载的临时 CSV，绝不碰用户本地文件
+            if is_temp and path and os.path.exists(path):
+                try:
+                    os.unlink(path)
+                except OSError:
+                    pass
 
     def create_kdbx(self, csv_file_path):
         db_password = "111"
         filename = datetime.now().strftime('%Y-%m-%d_%H-%M-%S') + '.kdbx'
-        output_dir = os.path.dirname(os.path.abspath(sys.executable if getattr(sys, 'frozen', False) else __file__))
+        output_dir = os.path.dirname(
+            os.path.abspath(sys.executable if getattr(sys, 'frozen', False) else __file__)
+        )
         kdbx_file = os.path.join(output_dir, filename)
 
         kp = create_database(kdbx_file, password=db_password)
@@ -235,20 +299,28 @@ class DragDropWidget(QWidget):
 
         with open(csv_file_path, 'r', encoding='utf-8') as f:
             reader = csv.reader(f)
-            next(reader)
+            next(reader)  # 跳过表头
             for row in reader:
                 if len(row) < 9:
                     continue
                 identifier = row[0]
 
-                email_entry = kp.add_entry(group_email, f"邮箱-{identifier}", row[1], row[2], "")
+                email_entry = kp.add_entry(
+                    group_email, f"邮箱-{identifier}", row[1], row[2], ""
+                )
                 if row[3]:
-                    email_entry.otp = f'otpauth://totp/{row[1]}?secret={row[3]}&issuer=邮箱-{identifier}'
+                    email_entry.otp = (
+                        f'otpauth://totp/{row[1]}?secret={row[3]}&issuer=邮箱-{identifier}'
+                    )
                 email_entry.notes = row[4]
 
-                account_entry = kp.add_entry(group_account, f"账号-{identifier}", row[5], row[6], "")
+                account_entry = kp.add_entry(
+                    group_account, f"账号-{identifier}", row[5], row[6], ""
+                )
                 if row[7]:
-                    account_entry.otp = f'otpauth://totp/{row[5]}?secret={row[7]}&issuer=账号-{identifier}'
+                    account_entry.otp = (
+                        f'otpauth://totp/{row[5]}?secret={row[7]}&issuer=账号-{identifier}'
+                    )
                 account_entry.notes = row[8]
 
         kp.save()
